@@ -3,8 +3,9 @@
 # This doesn't have a copy of Sakai put into it so it can be used for development where Sakai is mounted from outside
 # the container.
 
-# Use the Sun JVM 7
-FROM oxit/java:jdk-7u76
+# Use the OpenJDK image
+# This builds on debian jessie
+FROM oxit/java:jdk-8u74-01
 
 MAINTAINER Matthew Buckett <matthew.buckett@it.ox.ac.uk>
 
@@ -14,21 +15,29 @@ WORKDIR /tmp
 RUN groupadd --gid 10000 sakai && \
   useradd --uid 10000 --gid 10000 --system sakai 
 
+# The 1024 bit root CAs are no longer in Debian (https://bugs.debian.org/cgi-bin/bugreport.cgi?bug=812708)
+# and the cross signing isn't working in older versions of openssl
+COPY thawte_Premium_Server_CA.pem /usr/local/share/ca-certificates/thawte_permium_server_ca.crt
+RUN update-ca-certificates
+
 # Need to get the tomcat binary and unpack
 RUN mkdir -p /opt/tomcat && \
-  # We can't use the main mirror any more as they no longer contain the
+  # We don't use the main mirror as otherwise it stops working once newer versions are released.
   # version we want
-  # curl -s http://mirror.ox.ac.uk/sites/rsync.apache.org/tomcat/tomcat-7/v7.0.56/bin/apache-tomcat-7.0.56.tar.gz | \
-  curl -s https://archive.apache.org/dist/tomcat/tomcat-7/v7.0.56/bin/apache-tomcat-7.0.56.tar.gz | \
+  curl -s https://archive.apache.org/dist/tomcat/tomcat-8/v8.0.28/bin/apache-tomcat-8.0.28.tar.gz | \
   tar zxf - --strip-components 1 -C /opt/tomcat && \
   cd /opt/tomcat && \
   rm -r webapps && \
-  sed -i.orig '/^common.loader=/s@$@,${catalina.base}/common/classes/,${catalina.base}/common/lib/*.jar@;/^shared.loader=/s@$@${catalina.base}/shared/classes/,${catalina.base}/shared/lib/*.jar@;/^server.loader=/s@$@${catalina.base}/server/classes/,${catalina.base}/server/lib/*.jar@' conf/catalina.properties && \
-  sed -i.orig 's/^org.apache.catalina.startup.ContextConfig.jarsToSkip=.*/org.apache.catalina.startup.ContextConfig.jarsToSkip=*.jar/' conf/catalina.properties && \
-  mkdir -p shared/classes shared/lib common/classes common/lib server/classes server/lib webapps
+  mkdir webapps && \
+  # We change the classloader for tomcat so that we can map in a folder that just contains the Sakai additions.
+  mkdir /opt/tomcat/sakai-lib && \
+  sed -i.orig '/^common.loader=/s@$@,"${catalina.base}/sakai-lib/*.jar"@' conf/catalina.properties
+
 
 # Override with custom server.xml
 COPY server.xml /opt/tomcat/conf/server.xml
+# Speedup startup
+COPY context.xml /opt/tomcat/conf/context.xml
 
 # /opt/tomcat/sakai/logs is for Apache James logging.
 RUN mkdir -p /opt/scripts && \
@@ -45,25 +54,26 @@ RUN chown sakai /opt/tomcat/logs /opt/tomcat/temp /opt/tomcat/work /opt/tomcat/s
   chown sakai /opt/tomcat/sakai/sakai.properties
 
 # Copy in the JCE unlimited strength policy files
-RUN curl -sLO --cookie 'oraclelicense=accept-securebackup-cookie;'  http://download.oracle.com/otn-pub/java/jce/7/UnlimitedJCEPolicyJDK7.zip && \
-  jar xf UnlimitedJCEPolicyJDK7.zip && \
-  cp UnlimitedJCEPolicy/*.jar $JAVA_HOME/jre/lib/security && \
-  rm -r UnlimitedJCEPolicyJDK7.zip UnlimitedJCEPolicy
+RUN curl -sLO --cookie 'oraclelicense=accept-securebackup-cookie;'  http://download.oracle.com/otn-pub/java/jce/8/jce_policy-8.zip && \
+  jar xf jce_policy-8.zip && \
+  cp UnlimitedJCEPolicyJDK8/*.jar $JAVA_HOME/jre/lib/security && \
+  rm -r jce_policy-8.zip UnlimitedJCEPolicyJDK8
 
 # Setup all the logging to use log4j
 # This needs to go in the lib folder
-RUN curl -s -o /opt/tomcat/lib/tomcat-juli-adaptors.jar https://archive.apache.org/dist/tomcat/tomcat-7/v7.0.56/bin/extras/tomcat-juli-adapters.jar &&\
-  curl -s -o /opt/tomcat/bin/tomcat-juli.jar https://archive.apache.org/dist/tomcat/tomcat-7/v7.0.56/bin/extras/tomcat-juli.jar && \
+RUN curl -s -o /opt/tomcat/lib/tomcat-juli-adaptors.jar https://archive.apache.org/dist/tomcat/tomcat-8/v8.0.28/bin/extras/tomcat-juli-adapters.jar &&\
+  curl -s -o /opt/tomcat/bin/tomcat-juli.jar https://archive.apache.org/dist/tomcat/tomcat-8/v8.0.28/bin/extras/tomcat-juli.jar && \
   rm /opt/tomcat/conf/logging.properties
 
 # This sets the default locale and gets it to work correctly in Java
-ENV LANG en_GB.UTF-8
-RUN /usr/sbin/locale-gen $LANG
+ENV LANG en.UTF-8
+
+# TODO fix this
+#RUN /usr/sbin/locale-gen $LANG
 
 COPY ./entrypoint.sh /opt/scripts/entrypoint.sh
-RUN chmod 755 /opt/scripts/entrypoint.sh
 
-ENV CATALINA_OPTS_MEMORY -Xms256m -Xmx1024m -XX:NewSize=192m -XX:MaxNewSize=384m -XX:PermSize=192m -XX:MaxPermSize=384m
+ENV CATALINA_OPTS_MEMORY -Xms256m -Xmx1524m
 
 ENV CATALINA_OPTS \
 # Force the JVM to run in server mode (shouldn't be necessary, but better sure ).
@@ -72,10 +82,6 @@ ENV CATALINA_OPTS \
 -Djava.awt.headless=true \
 # Stop the JVM from caching DNS lookups, otherwise we don't get DNS changes propogating
 -Dsun.net.inetaddr.ttl=0 \
-# https://jira.sakaiproject.org/browse/SAK-16745 says it's no longer needed, need to test
--Dsun.lang.ClassLoader.allowArraySyntax=true \
-# https://jira.sakaiproject.org/browse/SAK-17425 Disable strict quoting on JSPs 
--Dorg.apache.jasper.compiler.Parser.STRICT_QUOTE_ESCAPING=false \
 # If the component manager doesn't start shut down the JVM
 -Dsakai.component.shutdownonerror=true \
 # Force the locale
